@@ -1,0 +1,399 @@
+//Librerías básicas
+#include <stdint.h>
+#include <stdbool.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+
+//librerías para ADC
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+
+//librería para pwm
+#include "driver/ledc.h"
+
+//libreria timer
+#include "driver/timer.h"
+
+//defines
+//pines 7 segmentos
+#define A_PIN 32
+#define B_PIN 33
+#define C_PIN 25
+#define D_PIN 26
+#define E_PIN 27
+#define F_PIN 14
+#define G_PIN 13
+
+//pines de los digitos
+
+#define SEG1_PIN 18
+#define SEG2_PIN 19
+#define SEG3_PIN 21
+
+//pines de las gates de los mosfet
+#define MOSFET1_PIN 5
+#define MOSFET2_PIN 15
+
+//pines de los botones
+#define BUTTON1_PIN 23
+#define BUTTON2_PIN 12
+#define BUTTON3_PIN 22
+
+//pines de los leds
+#define LED_R_PIN 17
+#define LED_G_PIN 16
+
+//variables de tiempo
+#define sample_period 1000 //definimos la frecuencia de muestreo
+#define mux 2000 //definimos la frecuencia de multiplexado
+#define DEBOUNCE_TIME 250000   // 250 ms
+#define DELAY_CAMBIO 2000000 // 5 segundos
+
+//variables para el debounce
+static volatile uint64_t last_b1_time = 0;
+static volatile uint64_t last_b2_time = 0;
+static volatile uint64_t last_b3_time = 0;
+
+static volatile bool boton_1 = false;
+static volatile bool boton_2 = false;
+static volatile bool boton_3 = false;
+
+//handles para ADC
+adc_oneshot_unit_handle_t adc1_handle;
+adc_cali_handle_t adc1_cali_handle;
+
+//isr de botones
+
+static void IRAM_ATTR button_1_isr_handler(void *arg){
+    uint64_t t = 0;
+    timer_get_counter_value(TIMER_GROUP_1, TIMER_1, &t);
+
+    if(t - last_b1_time >= DEBOUNCE_TIME){
+        boton_1 = true;
+        last_b1_time = t;
+    }
+}
+
+static void IRAM_ATTR button_2_isr_handler(void *arg){
+    uint64_t t = 0;
+    timer_get_counter_value(TIMER_GROUP_1, TIMER_1, &t);
+
+    if(t - last_b2_time >= DEBOUNCE_TIME){
+        boton_2 = true;
+        last_b2_time = t;
+    }
+}
+
+static void IRAM_ATTR button_3_isr_handler(void *arg){
+    uint64_t t = 0;
+    timer_get_counter_value(TIMER_GROUP_1, TIMER_1, &t);
+
+    if(t - last_b3_time >= DEBOUNCE_TIME){
+        boton_3 = true;
+        last_b3_time = t;
+    }
+}
+
+void app_main(){
+
+    //variables para el timer
+    uint64_t now = 0;
+    uint64_t last_timer_value=0;
+    uint64_t last_mux = 0;
+
+    //variables para el adc
+    int voltage_mv;
+    int adc_raw = 0;
+    int suma_mv = 0;
+    int muestras = 10;
+    int valor = 0;
+
+    //variables para la pwm
+    int duty = 0;
+
+    //variables de los segmentos
+    int digitos[10][7] = { 
+    {1,1,1,1,1,1,0}, // 0
+    {0,1,1,0,0,0,0}, // 1
+    {1,1,0,1,1,0,1}, // 2
+    {1,1,1,1,0,0,1}, // 3
+    {0,1,1,0,0,1,1}, // 4
+    {1,0,1,1,0,1,1}, // 5
+    {1,0,1,1,1,1,1}, // 6
+    {1,1,1,0,0,0,0}, // 7
+    {1,1,1,1,1,1,1}, // 8
+    {1,1,1,1,0,1,1}  // 9
+    };
+
+    int segmentos[7] = {A_PIN,B_PIN,C_PIN,D_PIN,E_PIN,F_PIN,G_PIN};
+
+    bool seg1_state = false;
+    bool seg2_state = true;
+    bool seg3_state = true;
+
+    int unidad = 0;
+    int decena = 0;
+    int centena = 0;
+    
+    //variables de la logica de control
+    bool enabled = false;
+    bool estado_rojo = false; // false = verde (mosfet 1y2), true = rojo (mosfet 3y4)
+
+    //configuracion de los gpios
+
+    gpio_config_t out_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL<<A_PIN) | (1ULL<<B_PIN) | (1ULL<<C_PIN) | (1ULL<<D_PIN) | (1ULL<<E_PIN) | (1ULL<<F_PIN) | (1ULL<<G_PIN) | (1ULL<<SEG1_PIN) | (1ULL<<SEG2_PIN) | (1ULL<<SEG3_PIN) | (1ULL<<MOSFET1_PIN) | (1ULL<<MOSFET2_PIN) | (1ULL<<LED_R_PIN) | (1ULL<<LED_G_PIN),
+        .pull_down_en = 0,
+        .pull_up_en = 0,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&out_conf);
+
+    gpio_config_t in_conf = {
+        .intr_type = GPIO_INTR_NEGEDGE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL<<BUTTON1_PIN) | (1ULL<<BUTTON2_PIN) | (1ULL<<BUTTON3_PIN),
+        .pull_down_en = 0,
+        .pull_up_en = 1
+    };
+    gpio_config(&in_conf);
+
+    //configuro las interrupciones de los botones
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BUTTON1_PIN, button_1_isr_handler, NULL);
+    gpio_isr_handler_add(BUTTON2_PIN, button_2_isr_handler, NULL);
+    gpio_isr_handler_add(BUTTON3_PIN, button_3_isr_handler, NULL);
+
+    //configuracion del adc
+    adc_oneshot_unit_init_cfg_t adc1_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+
+    adc_oneshot_new_unit(&adc1_cfg, &adc1_handle);
+
+    //configuracion del canal del adc
+    adc_oneshot_chan_cfg_t adc1_chan = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = ADC_ATTEN_DB_12,
+    };
+
+    adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_6, &adc1_chan);
+
+    //configuracion de la calibracion del adc
+    adc_cali_line_fitting_config_t adc1_cali_cfg = {
+        .unit_id = ADC_UNIT_1,
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    adc_cali_create_scheme_line_fitting(&adc1_cali_cfg, &adc1_cali_handle);
+
+    //configuracion del timer de la pwm
+    ledc_timer_config_t ledc_timer = {
+    .speed_mode       = LEDC_LOW_SPEED_MODE,
+    .timer_num        = LEDC_TIMER_0,
+    .duty_resolution  = LEDC_TIMER_12_BIT,  // 0 a 4095
+    .freq_hz          = 5000,               // frecuencia en Hz
+    .clk_cfg          = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&ledc_timer);
+
+    //configuracion del canal de la pwm
+    ledc_channel_config_t ledc_channel = {
+    .speed_mode = LEDC_LOW_SPEED_MODE,
+    .channel    = LEDC_CHANNEL_0,
+    .timer_sel  = LEDC_TIMER_0,
+    .intr_type  = LEDC_INTR_DISABLE,
+    .gpio_num   = 4,   // pin de salida
+    .duty       = 0,
+    .hpoint     = 0,
+    };
+    ledc_channel_config(&ledc_channel);
+
+    //configuracion del timer principal
+    timer_config_t timer_cfg = {
+        .divider = 80, 
+        .counter_dir = TIMER_COUNT_UP, 
+        .counter_en = TIMER_PAUSE, 
+        .alarm_en = TIMER_ALARM_DIS, 
+        .auto_reload = false,
+    };
+    timer_init(TIMER_GROUP_0, TIMER_0, &timer_cfg);
+    timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0);
+    timer_start(TIMER_GROUP_0, TIMER_0);
+
+    //configuracion del timer para debounce de botones
+    timer_config_t timer_cfg2 = {
+        .divider = 80, 
+        .counter_dir = TIMER_COUNT_UP, 
+        .counter_en = TIMER_PAUSE, 
+        .alarm_en = TIMER_ALARM_DIS, 
+        .auto_reload = false,
+    };
+    timer_init(TIMER_GROUP_1, TIMER_1, &timer_cfg2);
+    timer_set_counter_value(TIMER_GROUP_1, TIMER_1, 0);
+    timer_start(TIMER_GROUP_1, TIMER_1);
+
+    //inicializamos los pines
+    gpio_set_level(A_PIN, 0);
+    gpio_set_level(B_PIN, 0);
+    gpio_set_level(C_PIN, 0);
+    gpio_set_level(D_PIN, 0);
+    gpio_set_level(E_PIN, 0);
+    gpio_set_level(F_PIN, 0);
+    gpio_set_level(G_PIN, 0);
+
+    gpio_set_level(SEG1_PIN, 0);
+    gpio_set_level(SEG2_PIN, 1);
+    gpio_set_level(SEG3_PIN, 1);
+
+    gpio_set_level(MOSFET1_PIN, 0);
+    gpio_set_level(MOSFET2_PIN, 0);
+
+    gpio_set_level(LED_R_PIN, 0);
+    gpio_set_level(LED_G_PIN, 1);
+
+    while(1){
+
+        //leemos el valor del timer
+        timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &now);
+
+        //leemos el adc cada periodo de muestreo
+        if (now - last_timer_value >= sample_period){
+
+            suma_mv = 0;
+
+            for(int i = 0; i < muestras; i++){
+                adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &adc_raw);
+                adc_cali_raw_to_voltage(adc1_cali_handle, adc_raw, &voltage_mv);
+                suma_mv += voltage_mv;
+            }
+            voltage_mv = suma_mv / muestras;
+
+            if (voltage_mv < 170) voltage_mv = 170;
+            if (voltage_mv > 3120) voltage_mv = 3120;
+
+            // Convertimos de 0-3300mV a 0-100 para el pote
+            valor = (voltage_mv - 170) * 100 / (3120 - 170);
+
+            // Separamos en dígitos
+            centena = valor / 100;        
+            decena  = (valor / 10) % 10;
+            unidad  = valor % 10;        
+            last_timer_value = now;
+        }
+
+        //logica de control
+        
+        if(boton_2 == true){
+            boton_2 = false;
+            if(estado_rojo == false){
+                estado_rojo = true;
+                gpio_set_level(LED_R_PIN, 1);
+                gpio_set_level(LED_G_PIN, 0);
+                gpio_set_level(MOSFET1_PIN, 0);
+                gpio_set_level(MOSFET2_PIN, 0);
+                
+                if(enabled ==true){
+                    //esperamos
+                    // esperar
+                    uint64_t t_inicio = 0;
+                    timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &t_inicio);
+                    while(now - t_inicio < DELAY_CAMBIO){
+                        timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &now);
+                    }
+                    // activar mosfet2
+                    gpio_set_level(MOSFET2_PIN, 1);
+                }
+            }
+        }
+
+        if(boton_1 ==true){
+        boton_1 = false;
+        if(estado_rojo ==true){
+            estado_rojo = false;
+            gpio_set_level(LED_G_PIN, 1);
+            gpio_set_level(LED_R_PIN, 0);
+            gpio_set_level(MOSFET1_PIN, 0);
+            gpio_set_level(MOSFET2_PIN, 0);
+
+            if(enabled ==true){
+                //esperamos
+                uint64_t t_inicio = 0;
+                timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &t_inicio);
+                while(now - t_inicio < DELAY_CAMBIO){
+                    timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &now);
+                }
+                gpio_set_level(MOSFET1_PIN, 1);
+            }
+        }
+    }
+
+        if(boton_3==true){
+            boton_3 = false;
+            if(enabled==false){
+                // encender maquina
+                enabled = true;
+                if(estado_rojo){
+                    gpio_set_level(MOSFET2_PIN, 1);
+                } else {
+                    gpio_set_level(MOSFET1_PIN, 1);
+                }
+            } else {
+                // apagar maquina
+                enabled = false;
+                ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+            }
+        }
+
+        // pwm solo si esta habilitado
+        if(enabled ==true){
+            duty = (valor * 4095) / 100;
+            ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+            ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+        }
+
+        //actualizamos los displays segun el multiplexado
+        if(now - last_mux >= mux){
+            last_mux = now;
+
+            // 1. apagar todos los displays
+            gpio_set_level(SEG1_PIN, 1);
+            gpio_set_level(SEG2_PIN, 1);
+            gpio_set_level(SEG3_PIN, 1);
+
+            // 2. escoger qué número cargar
+            if(seg1_state == false){
+                for (int i = 0; i < 7; i++){
+                    gpio_set_level(segmentos[i], !digitos[unidad][i]);
+                }
+                gpio_set_level(SEG1_PIN, 0);
+                seg1_state = true;
+                seg2_state = false;
+                seg3_state = true;
+            }
+            else if(seg2_state == false){
+                for (int i = 0; i < 7; i++){
+                    gpio_set_level(segmentos[i], !digitos[decena][i]);
+                }
+                gpio_set_level(SEG2_PIN, 0);
+                seg1_state = true;
+                seg2_state = true;
+                seg3_state = false;
+            }
+            else if(seg3_state == false){
+                for (int i = 0; i < 7; i++){
+                    gpio_set_level(segmentos[i], !digitos[centena][i]);
+                }
+                gpio_set_level(SEG3_PIN, 0);
+                seg1_state = false;
+                seg2_state = true;
+                seg3_state = true;
+            }
+        }
+    }
+}
