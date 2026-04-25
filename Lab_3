@@ -9,10 +9,21 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 
+//libreria pwm 
+#include "driver/ledc.h"
+
 #define BUF_SIZE 1024
     //AQUI VA TODO LO DE UART
 
 #define BOMBILLA_PIN 10 
+#define STEP_PIN 18
+#define DIR_PIN  19
+#define LED_PWM_PIN 4  
+
+// variable global para llevar el tiempo del último paso
+static uint64_t last_step_time = 0;
+static float tc = 25.0f; // temperatura de control inicial
+static int led_duty = 0; // para reportar el duty actual de los leds
 
 
 void uart_init(void) {
@@ -66,7 +77,8 @@ float uart_receive_set_temp(void) {
     }
     return -1; // No llegó ningún comando válido
 }
-    // AQUI VA TODO LO DEL ADC PARA EL LM35 Y PARA EL LDR
+
+// AQUI VA TODO LO DEL ADC PARA EL LM35 Y PARA EL LDR
 
 // handles globales 
 adc_oneshot_unit_handle_t adc1_handle;
@@ -154,12 +166,95 @@ void bombilla_set(bool encendida) {
     }
 }
 
-app_main(void){
+//ahora todo lo del stepper y su driver
 
-    float tc = 25; // Temperatura de control inicial
+void stepper_init(void) {
+    gpio_config_t out_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL << STEP_PIN) | (1ULL << DIR_PIN),
+        .pull_down_en = 0,
+        .pull_up_en = 0,
+    };
+    gpio_config(&out_conf);
+    gpio_set_level(STEP_PIN, 0);
+    gpio_set_level(DIR_PIN, 0);
 
+    timer_config_t timer_cfg = {
+        .divider = 80,
+        .counter_dir = TIMER_COUNT_UP,
+        .counter_en = TIMER_PAUSE,
+        .alarm_en = TIMER_ALARM_DIS,
+        .auto_reload = false,
+    };
+    timer_init(TIMER_GROUP_0, TIMER_0, &timer_cfg);
+    timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0);
+    timer_start(TIMER_GROUP_0, TIMER_0);
+}
+
+// direccion: true = horario (calefaccion), false = antihorario (ventilacion)
+// steps_per_sec: frecuencia de pasos (100, 300 o 600)
+void stepper_run(bool horario, int steps_per_sec) {
+    uint64_t now = 0;
+    timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &now);
+
+    // convertimos steps/s a microsegundos entre pasos
+    uint64_t intervalo_us = 1000000 / steps_per_sec;
+
+    // solo damos un paso si ya pasó el tiempo necesario
+    if (now - last_step_time >= intervalo_us) {
+        gpio_set_level(DIR_PIN, horario);
+
+        // pulso de step
+        gpio_set_level(STEP_PIN, 1);
+        last_step_time = now;
+    }
+
+    if (now - last_step_time >= 10) {
+        gpio_set_level(STEP_PIN, 0);
+    }
+}
+
+//ahora los leds controlados por una PWM
+
+void leds_init(void) {
+    // timer PWM
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .timer_num       = LEDC_TIMER_0,
+        .duty_resolution = LEDC_TIMER_12_BIT, // 0 a 4095
+        .freq_hz         = 5000,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&ledc_timer);
+
+    // canal PWM
+    ledc_channel_config_t ledc_channel = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = LEDC_CHANNEL_0,
+        .timer_sel  = LEDC_TIMER_0,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .gpio_num   = LED_PWM_PIN,
+        .duty       = 0, // apagado por defecto
+        .hpoint     = 0,
+    };
+    ledc_channel_config(&ledc_channel);
+}
+
+// porcentaje: 0-100
+void leds_set(int porcentaje) {
+    // convertimos porcentaje a duty de 12 bits (0-4095)
+    int duty = (porcentaje * 4095) / 100;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+void app_main(void){
     adc_lm35_init();
     uart_init();
+    bombilla_init();
+    stepper_init();
+    leds_init();
 
     while(1){
         float nueva_tc = uart_receive_set_temp();
@@ -172,5 +267,44 @@ app_main(void){
         } else {
             bombilla_set(false); // apagar calefacción
         }
+
+        //CONTROL DEL STEPPER
+
+        if (temp < (tc - 1.0f)) {
+            stepper_run(true, 100); // calefacción baja
+        } else if (temp > (tc + 1.0f) && temp < (tc + 3.0f)) {
+            stepper_run(false, 100); // ventilación baja
+        } else if (temp >= (tc + 3.0f) && temp <= (tc + 5.0f)) {
+            stepper_run(false, 300); // ventilación media
+        } else if (temp > (tc + 5.0f)) {
+            stepper_run(false, 600); // ventilación alta
+        } else {
+            stepper_stop();          // rango muerto, todo apagado
+        }
+        
+        //CONTROL DE LOS LEDS
+
+        // control de iluminación según el LDR
+        if (luz < 20.0f) {
+            leds_set(100);
+            led_duty = 100;
+        } else if (luz < 30.0f) {
+            leds_set(80);
+            led_duty = 80;
+        } else if (luz < 40.0f) {
+            leds_set(60);
+            led_duty = 60;
+        } else if (luz < 60.0f) {
+            leds_set(50);
+            led_duty = 50;
+        } else if (luz < 80.0f) {
+            leds_set(30);
+            led_duty = 30;
+        } else {
+            leds_set(0); // apagados
+            led_duty = 0;
+        }
+
+        uart_send(tc, temp, led_duty);
     }
 }
