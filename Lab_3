@@ -1,0 +1,176 @@
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/uart.h"
+#include <string.h>
+#include <stdio.h>
+
+//librerías para ADC
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+
+#define BUF_SIZE 1024
+    //AQUI VA TODO LO DE UART
+
+#define BOMBILLA_PIN 10 
+
+
+void uart_init(void) {
+    uart_config_t uart_config = {
+        .baud_rate  = 115200,              // Velocidad: 115200 símbolos/segundo
+        .data_bits  = UART_DATA_8_BITS,    // 8 bits de datos por trama
+        .parity     = UART_PARITY_DISABLE, // Sin bit de paridad (N)
+        .stop_bits  = UART_STOP_BITS_1,    // 1 stop bit (1)
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE, // Sin control de flujo por hardware
+        .source_clk = UART_SCLK_DEFAULT,   // Reloj interno por defecto
+    };
+
+    // Aplica la configuración al periférico UART0
+    uart_param_config(UART_NUM_0, &uart_config);
+
+    // Usa los pines por defecto del UART0 (los del USB-Serial integrado)
+    uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    // Instala el driver: reserva BUF_SIZE bytes para RX y TX en memoria
+    // Los últimos 3 parámetros (0, NULL, 0) indican que no usamos interrupciones por cola
+    uart_driver_install(UART_NUM_0, BUF_SIZE, BUF_SIZE, 0, NULL, 0);
+}
+
+// Empaqueta los datos en un string legible y los transmite por TX
+void uart_send(float temp_control, float temp_sensor, int led_pct) {
+    char buf[64];
+    // Formatea el mensaje: ej. "Tc:22.0 T:25.3 LED:80%\n"
+    sprintf(buf, "Tc:%.1f T:%.1f LED:%d%%\n", temp_control, temp_sensor, led_pct);
+    // Envía los bytes por la línea TX del UART0
+    uart_write_bytes(UART_NUM_0, buf, strlen(buf));
+}
+
+// Escucha el puerto RX buscando el comando "SET_TEMP:XX"
+// Retorna la nueva temperatura si llegó el comando, o -1 si no hay nada
+float uart_receive_set_temp(void) {
+    uint8_t rx_buf[BUF_SIZE];
+
+    // Lee bytes disponibles en el buffer RX
+    // Espera máximo 10ms antes de continuar (no bloquea el programa)
+    int len = uart_read_bytes(UART_NUM_0, rx_buf, BUF_SIZE - 1, 10 / portTICK_PERIOD_MS);
+
+    if (len > 0) {
+        rx_buf[len] = '\0'; // Termina el string para poder procesarlo con sscanf
+
+        float val;
+        // Intenta extraer el número XX del comando "SET_TEMP:XX"
+        // sscanf retorna 1 si encontró exactamente un valor flotante
+        if (sscanf((char*)rx_buf, "SET_TEMP:%f", &val) == 1) {
+            return val; // Comando válido: retorna la nueva Tc
+        }
+    }
+    return -1; // No llegó ningún comando válido
+}
+    // AQUI VA TODO LO DEL ADC PARA EL LM35 Y PARA EL LDR
+
+// handles globales 
+adc_oneshot_unit_handle_t adc1_handle;
+adc_cali_handle_t adc1_cali_handle;
+
+void adc_lm35_init(void) {
+    // Inicializar unidad ADC1
+    adc_oneshot_unit_init_cfg_t adc1_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    adc_oneshot_new_unit(&adc1_cfg, &adc1_handle);
+
+    // Configurar canal (ajusta ADC_CHANNEL_X al pin que conectaste)
+    adc_oneshot_chan_cfg_t adc1_chan = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = ADC_ATTEN_DB_12, // rango hasta ~3.1V
+    };
+    //configurar el canal para el LM35
+    adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_6, &adc1_chan);
+    // Configurar canal para el LDR 
+    adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_4, &adc1_chan); // Y = pin del LDR
+
+    // Calibración
+    adc_cali_line_fitting_config_t adc1_cali_cfg = {
+        .unit_id = ADC_UNIT_1,
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    adc_cali_create_scheme_line_fitting(&adc1_cali_cfg, &adc1_cali_handle);
+}
+
+float lm35_read(void) {
+    int adc_raw, voltage_mv, suma_mv = 0;
+    int muestras = 10;
+
+    // Promediamos 10 lecturas igual que en tu referencia
+    for (int i = 0; i < muestras; i++) {
+        adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &adc_raw);
+        adc_cali_raw_to_voltage(adc1_cali_handle, adc_raw, &voltage_mv);
+        suma_mv += voltage_mv;
+    }
+    voltage_mv = suma_mv / muestras;
+
+    // El LM35 da 10mV/°C, pero el opamp amplifica x3
+    // entonces: T = voltage_mv / (10mV * 3)
+    float temperatura = voltage_mv / 30.0f; //por ejemplo 100 grados serian 3000mV, entonces 3000/30 = 100 grados
+
+    return temperatura;
+}
+float ldr_read(void) {
+    int adc_raw, voltage_mv, suma_mv = 0;
+    int muestras = 10;
+
+    for (int i = 0; i < muestras; i++) {
+        adc_oneshot_read(adc1_handle, ADC_CHANNEL_4, &adc_raw);
+        adc_cali_raw_to_voltage(adc1_cali_handle, adc_raw, &voltage_mv);
+        suma_mv += voltage_mv;
+    }
+    voltage_mv = suma_mv / muestras;
+
+    // El LDR con divisor de voltaje: 3.3V - LDR - 10k - GND
+    // A más luz, más voltaje. Normalizamos a porcentaje 0-100
+    float porcentaje = (voltage_mv * 100.0f) / 3300.0f;
+
+    return porcentaje;
+}
+
+void bombilla_init(void) {
+    gpio_config_t out_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL << BOMBILLA_PIN),
+        .pull_down_en = 0,
+        .pull_up_en = 0,
+    };
+    gpio_config(&out_conf);
+    gpio_set_level(BOMBILLA_PIN, 0); // apagada por defecto
+}
+
+void bombilla_set(bool encendida) {
+        if (encendida) {
+        gpio_set_level(BOMBILLA_PIN, 1);
+    } else {
+        gpio_set_level(BOMBILLA_PIN, 0);
+    }
+}
+
+app_main(void){
+
+    float tc = 25; // Temperatura de control inicial
+
+    adc_lm35_init();
+    uart_init();
+
+    while(1){
+        float nueva_tc = uart_receive_set_temp();
+        if (nueva_tc != -1) tc = nueva_tc;
+        float temp = lm35_read();
+        float luz = ldr_read();
+
+        if (temp < (tc - 1.0f)) {
+            bombilla_set(true);  // calefacción
+        } else {
+            bombilla_set(false); // apagar calefacción
+        }
+    }
+}
