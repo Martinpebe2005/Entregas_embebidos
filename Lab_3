@@ -1,190 +1,91 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/uart.h"
-#include <string.h>
-#include <stdio.h>
-
-//librerías para ADC
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "driver/timer.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include <string.h>
+#include <stdio.h>
 
-//libreria pwm 
-#include "driver/ledc.h"
+// ─── DEFINES ───────────────────────────────────────────────────────────────
+#define BUF_SIZE      1024
+#define BOMBILLA_PIN  10
+#define STEP_PIN      18
+#define DIR_PIN       19
+#define LED_PWM_PIN   4
 
-#define BUF_SIZE 1024
-    //AQUI VA TODO LO DE UART
-
-#define BOMBILLA_PIN 10 
-#define STEP_PIN 18
-#define DIR_PIN  19
-#define LED_PWM_PIN 4  
-
-// variable global para llevar el tiempo del último paso
+// ─── GLOBALES ──────────────────────────────────────────────────────────────
+static float    tc            = 25.0f;
+static int      led_duty      = 0;
 static uint64_t last_step_time = 0;
-static float tc = 25.0f; // temperatura de control inicial
-static int led_duty = 0; // para reportar el duty actual de los leds
 
+adc_oneshot_unit_handle_t adc1_handle;
+adc_cali_handle_t         adc1_cali_handle;
 
+// ─── INIT ──────────────────────────────────────────────────────────────────
 void uart_init(void) {
-    uart_config_t uart_config = {
-        .baud_rate  = 115200,              // Velocidad: 115200 símbolos/segundo
-        .data_bits  = UART_DATA_8_BITS,    // 8 bits de datos por trama
-        .parity     = UART_PARITY_DISABLE, // Sin bit de paridad (N)
-        .stop_bits  = UART_STOP_BITS_1,    // 1 stop bit (1)
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE, // Sin control de flujo por hardware
-        .source_clk = UART_SCLK_DEFAULT,   // Reloj interno por defecto
+    uart_config_t cfg = {
+        .baud_rate  = 115200,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
     };
-
-    // Aplica la configuración al periférico UART0
-    uart_param_config(UART_NUM_0, &uart_config);
-
-    // Usa los pines por defecto del UART0 (los del USB-Serial integrado)
-    uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-
-    // Instala el driver: reserva BUF_SIZE bytes para RX y TX en memoria
-    // Los últimos 3 parámetros (0, NULL, 0) indican que no usamos interrupciones por cola
+    uart_param_config(UART_NUM_0, &cfg);
+    uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                             UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_driver_install(UART_NUM_0, BUF_SIZE, BUF_SIZE, 0, NULL, 0);
 }
 
-// Empaqueta los datos en un string legible y los transmite por TX
-void uart_send(float temp_control, float temp_sensor, int led_pct) {
-    char buf[64];
-    // Formatea el mensaje: ej. "Tc:22.0 T:25.3 LED:80%\n"
-    sprintf(buf, "Tc:%.1f T:%.1f LED:%d%%\n", temp_control, temp_sensor, led_pct);
-    // Envía los bytes por la línea TX del UART0
-    uart_write_bytes(UART_NUM_0, buf, strlen(buf));
-}
+void adc_init(void) {
+    adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT_1 };
+    adc_oneshot_new_unit(&unit_cfg, &adc1_handle);
 
-// Escucha el puerto RX buscando el comando "SET_TEMP:XX"
-// Retorna la nueva temperatura si llegó el comando, o -1 si no hay nada
-float uart_receive_set_temp(void) {
-    uint8_t rx_buf[BUF_SIZE];
-
-    // Lee bytes disponibles en el buffer RX
-    // Espera máximo 10ms antes de continuar (no bloquea el programa)
-    int len = uart_read_bytes(UART_NUM_0, rx_buf, BUF_SIZE - 1, 10 / portTICK_PERIOD_MS);
-
-    if (len > 0) {
-        rx_buf[len] = '\0'; // Termina el string para poder procesarlo con sscanf
-
-        float val;
-        // Intenta extraer el número XX del comando "SET_TEMP:XX"
-        // sscanf retorna 1 si encontró exactamente un valor flotante
-        if (sscanf((char*)rx_buf, "SET_TEMP:%f", &val) == 1) {
-            return val; // Comando válido: retorna la nueva Tc
-        }
-    }
-    return -1; // No llegó ningún comando válido
-}
-
-// AQUI VA TODO LO DEL ADC PARA EL LM35 Y PARA EL LDR
-
-// handles globales 
-adc_oneshot_unit_handle_t adc1_handle;
-adc_cali_handle_t adc1_cali_handle;
-
-void adc_lm35_init(void) {
-    // Inicializar unidad ADC1
-    adc_oneshot_unit_init_cfg_t adc1_cfg = {
-        .unit_id = ADC_UNIT_1,
-    };
-    adc_oneshot_new_unit(&adc1_cfg, &adc1_handle);
-
-    // Configurar canal (ajusta ADC_CHANNEL_X al pin que conectaste)
-    adc_oneshot_chan_cfg_t adc1_chan = {
+    adc_oneshot_chan_cfg_t chan_cfg = {
         .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten = ADC_ATTEN_DB_12, // rango hasta ~3.1V
+        .atten    = ADC_ATTEN_DB_12,
     };
-    //configurar el canal para el LM35
-    adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_6, &adc1_chan);
-    // Configurar canal para el LDR 
-    adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_4, &adc1_chan); // Y = pin del LDR
+    adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_6, &chan_cfg); // LM35
+    adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_4, &chan_cfg); // LDR
 
-    // Calibración
-    adc_cali_line_fitting_config_t adc1_cali_cfg = {
-        .unit_id = ADC_UNIT_1,
-        .atten = ADC_ATTEN_DB_12,
+    adc_cali_line_fitting_config_t cali_cfg = {
+        .unit_id  = ADC_UNIT_1,
+        .atten    = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
-    adc_cali_create_scheme_line_fitting(&adc1_cali_cfg, &adc1_cali_handle);
-}
-
-float lm35_read(void) {
-    int adc_raw, voltage_mv, suma_mv = 0;
-    int muestras = 10;
-
-    // Promediamos 10 lecturas igual que en tu referencia
-    for (int i = 0; i < muestras; i++) {
-        adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &adc_raw);
-        adc_cali_raw_to_voltage(adc1_cali_handle, adc_raw, &voltage_mv);
-        suma_mv += voltage_mv;
-    }
-    voltage_mv = suma_mv / muestras;
-
-    // El LM35 da 10mV/°C, pero el opamp amplifica x3
-    // entonces: T = voltage_mv / (10mV * 3)
-    float temperatura = voltage_mv / 30.0f; //por ejemplo 100 grados serian 3000mV, entonces 3000/30 = 100 grados
-
-    return temperatura;
-}
-float ldr_read(void) {
-    int adc_raw, voltage_mv, suma_mv = 0;
-    int muestras = 10;
-
-    for (int i = 0; i < muestras; i++) {
-        adc_oneshot_read(adc1_handle, ADC_CHANNEL_4, &adc_raw);
-        adc_cali_raw_to_voltage(adc1_cali_handle, adc_raw, &voltage_mv);
-        suma_mv += voltage_mv;
-    }
-    voltage_mv = suma_mv / muestras;
-
-    // El LDR con divisor de voltaje: 3.3V - LDR - 10k - GND
-    // A más luz, más voltaje. Normalizamos a porcentaje 0-100
-    float porcentaje = (voltage_mv * 100.0f) / 3300.0f;
-
-    return porcentaje;
+    adc_cali_create_scheme_line_fitting(&cali_cfg, &adc1_cali_handle);
 }
 
 void bombilla_init(void) {
-    gpio_config_t out_conf = {
-        .intr_type = GPIO_INTR_DISABLE,
-        .mode = GPIO_MODE_OUTPUT,
+    gpio_config_t cfg = {
+        .intr_type    = GPIO_INTR_DISABLE,
+        .mode         = GPIO_MODE_OUTPUT,
         .pin_bit_mask = (1ULL << BOMBILLA_PIN),
-        .pull_down_en = 0,
-        .pull_up_en = 0,
     };
-    gpio_config(&out_conf);
-    gpio_set_level(BOMBILLA_PIN, 0); // apagada por defecto
+    gpio_config(&cfg);
+    gpio_set_level(BOMBILLA_PIN, 0);
 }
-
-void bombilla_set(bool encendida) {
-        if (encendida) {
-        gpio_set_level(BOMBILLA_PIN, 1);
-    } else {
-        gpio_set_level(BOMBILLA_PIN, 0);
-    }
-}
-
-//ahora todo lo del stepper y su driver
 
 void stepper_init(void) {
-    gpio_config_t out_conf = {
-        .intr_type = GPIO_INTR_DISABLE,
-        .mode = GPIO_MODE_OUTPUT,
+    gpio_config_t cfg = {
+        .intr_type    = GPIO_INTR_DISABLE,
+        .mode         = GPIO_MODE_OUTPUT,
         .pin_bit_mask = (1ULL << STEP_PIN) | (1ULL << DIR_PIN),
-        .pull_down_en = 0,
-        .pull_up_en = 0,
     };
-    gpio_config(&out_conf);
+    gpio_config(&cfg);
     gpio_set_level(STEP_PIN, 0);
-    gpio_set_level(DIR_PIN, 0);
+    gpio_set_level(DIR_PIN,  0);
 
+    // timer con divider 80 → 1 tick = 1us
     timer_config_t timer_cfg = {
-        .divider = 80,
+        .divider     = 80,
         .counter_dir = TIMER_COUNT_UP,
-        .counter_en = TIMER_PAUSE,
-        .alarm_en = TIMER_ALARM_DIS,
+        .counter_en  = TIMER_PAUSE,
+        .alarm_en    = TIMER_ALARM_DIS,
         .auto_reload = false,
     };
     timer_init(TIMER_GROUP_0, TIMER_0, &timer_cfg);
@@ -192,118 +93,140 @@ void stepper_init(void) {
     timer_start(TIMER_GROUP_0, TIMER_0);
 }
 
-// direccion: true = horario (calefaccion), false = antihorario (ventilacion)
-// steps_per_sec: frecuencia de pasos (100, 300 o 600)
-void stepper_run(bool horario, int steps_per_sec) {
-    uint64_t now = 0;
-    timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &now);
-
-    // convertimos steps/s a microsegundos entre pasos
-    uint64_t intervalo_us = 1000000 / steps_per_sec;
-
-    // solo damos un paso si ya pasó el tiempo necesario
-    if (now - last_step_time >= intervalo_us) {
-        gpio_set_level(DIR_PIN, horario);
-
-        // pulso de step
-        gpio_set_level(STEP_PIN, 1);
-        last_step_time = now;
-    }
-
-    if (now - last_step_time >= 10) {
-        gpio_set_level(STEP_PIN, 0);
-    }
-}
-
-//ahora los leds controlados por una PWM
-
 void leds_init(void) {
-    // timer PWM
-    ledc_timer_config_t ledc_timer = {
+    ledc_timer_config_t timer = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .timer_num       = LEDC_TIMER_0,
-        .duty_resolution = LEDC_TIMER_12_BIT, // 0 a 4095
+        .duty_resolution = LEDC_TIMER_12_BIT,
         .freq_hz         = 5000,
         .clk_cfg         = LEDC_AUTO_CLK,
     };
-    ledc_timer_config(&ledc_timer);
+    ledc_timer_config(&timer);
 
-    // canal PWM
-    ledc_channel_config_t ledc_channel = {
+    ledc_channel_config_t channel = {
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .channel    = LEDC_CHANNEL_0,
         .timer_sel  = LEDC_TIMER_0,
         .intr_type  = LEDC_INTR_DISABLE,
         .gpio_num   = LED_PWM_PIN,
-        .duty       = 0, // apagado por defecto
+        .duty       = 0,
         .hpoint     = 0,
     };
-    ledc_channel_config(&ledc_channel);
+    ledc_channel_config(&channel);
 }
 
-// porcentaje: 0-100
+// ─── LECTURA DE SENSORES ───────────────────────────────────────────────────
+float lm35_read(void) {
+    int raw, mv, suma = 0;
+    for (int i = 0; i < 10; i++) {
+        adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &raw);
+        adc_cali_raw_to_voltage(adc1_cali_handle, raw, &mv);
+        suma += mv;
+    }
+    // LM35: 10mV/°C, opamp ganancia x3 → T = mv/30
+    return (suma / 10) / 10.0f;
+}
+
+float ldr_read(void) {
+    int raw, mv, suma = 0;
+    for (int i = 0; i < 10; i++) {
+        adc_oneshot_read(adc1_handle, ADC_CHANNEL_4, &raw);
+        adc_cali_raw_to_voltage(adc1_cali_handle, raw, &mv);
+        suma += mv;
+    }
+    // divisor 3.3V-LDR-10k-GND → normalizado a 0-100%
+    return ((suma / 10) * 100.0f) / 3300.0f;
+}
+
+// ─── CONTROL DE ACTUADORES ─────────────────────────────────────────────────
+void uart_send(float temp_control, float temp_sensor, int led_pct) {
+    char buf[64];
+    sprintf(buf, "Tc:%.1f T:%.1f LED:%d%%\n", temp_control, temp_sensor, led_pct);
+    uart_write_bytes(UART_NUM_0, buf, strlen(buf));
+}
+
+float uart_receive_set_temp(void) {
+    uint8_t rx_buf[BUF_SIZE];
+    int len = uart_read_bytes(UART_NUM_0, rx_buf, BUF_SIZE - 1, 10 / portTICK_PERIOD_MS);
+    if (len > 0) {
+        rx_buf[len] = '\0';
+        float val;
+        if (sscanf((char*)rx_buf, "SET_TEMP:%f", &val) == 1) return val;
+    }
+    return -1;
+}
+
+void bombilla_set(bool encendida) {
+    gpio_set_level(BOMBILLA_PIN, encendida);
+}
+
+void stepper_run(bool horario, int steps_per_sec) {
+    uint64_t now = 0;
+    timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &now);
+    uint64_t intervalo_us = 1000000 / steps_per_sec;
+
+    if (now - last_step_time >= intervalo_us) {
+        gpio_set_level(DIR_PIN,  horario);
+        gpio_set_level(STEP_PIN, 1);
+        last_step_time = now;
+    }
+    if (now - last_step_time >= 10) {
+        gpio_set_level(STEP_PIN, 0);
+    }
+}
+
+void stepper_stop(void) {
+    gpio_set_level(STEP_PIN, 0);
+    gpio_set_level(DIR_PIN,  0);
+}
+
 void leds_set(int porcentaje) {
-    // convertimos porcentaje a duty de 12 bits (0-4095)
     int duty = (porcentaje * 4095) / 100;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
-void app_main(void){
-    adc_lm35_init();
+// ─── APP MAIN ──────────────────────────────────────────────────────────────
+void app_main(void) {
     uart_init();
+    adc_init();
     bombilla_init();
     stepper_init();
     leds_init();
 
-    while(1){
+    while (1) {
+        // recibir nueva Tc si el usuario la envió
         float nueva_tc = uart_receive_set_temp();
         if (nueva_tc != -1) tc = nueva_tc;
+
         float temp = lm35_read();
-        float luz = ldr_read();
+        float luz  = ldr_read();
 
+        // control de temperatura y motor
         if (temp < (tc - 1.0f)) {
-            bombilla_set(true);  // calefacción
-        } else {
-            bombilla_set(false); // apagar calefacción
-        }
-
-        //CONTROL DEL STEPPER
-
-        if (temp < (tc - 1.0f)) {
-            stepper_run(true, 100); // calefacción baja
+            bombilla_set(true);
+            stepper_run(true, 100);
         } else if (temp > (tc + 1.0f) && temp < (tc + 3.0f)) {
-            stepper_run(false, 100); // ventilación baja
+            bombilla_set(false);
+            stepper_run(false, 100);
         } else if (temp >= (tc + 3.0f) && temp <= (tc + 5.0f)) {
-            stepper_run(false, 300); // ventilación media
+            bombilla_set(false);
+            stepper_run(false, 300);
         } else if (temp > (tc + 5.0f)) {
-            stepper_run(false, 600); // ventilación alta
+            bombilla_set(false);
+            stepper_run(false, 600);
         } else {
-            stepper_stop();          // rango muerto, todo apagado
+            bombilla_set(false);
+            stepper_stop();
         }
-        
-        //CONTROL DE LOS LEDS
 
-        // control de iluminación según el LDR
-        if (luz < 20.0f) {
-            leds_set(100);
-            led_duty = 100;
-        } else if (luz < 30.0f) {
-            leds_set(80);
-            led_duty = 80;
-        } else if (luz < 40.0f) {
-            leds_set(60);
-            led_duty = 60;
-        } else if (luz < 60.0f) {
-            leds_set(50);
-            led_duty = 50;
-        } else if (luz < 80.0f) {
-            leds_set(30);
-            led_duty = 30;
-        } else {
-            leds_set(0); // apagados
-            led_duty = 0;
-        }
+        // control de iluminación
+        if      (luz < 20.0f) { leds_set(100); led_duty = 100; }
+        else if (luz < 30.0f) { leds_set(80);  led_duty = 80;  }
+        else if (luz < 40.0f) { leds_set(60);  led_duty = 60;  }
+        else if (luz < 60.0f) { leds_set(50);  led_duty = 50;  }
+        else if (luz < 80.0f) { leds_set(30);  led_duty = 30;  }
+        else                  { leds_set(0);   led_duty = 0;   }
 
         uart_send(tc, temp, led_duty);
     }
