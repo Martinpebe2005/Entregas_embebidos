@@ -12,6 +12,8 @@
 
 // ─── DEFINES ───────────────────────────────────────────────────────────────
 #define BUF_SIZE      1024
+#define LDR_MIN_MV    200
+#define LDR_MAX_MV    3000
 #define BOMBILLA_PIN  10
 #define STEP_PIN      18
 #define DIR_PIN       19
@@ -123,7 +125,7 @@ float lm35_read(void) {
         adc_cali_raw_to_voltage(adc1_cali_handle, raw, &mv);
         suma += mv;
     }
-    // LM35: 10mV/°C, opamp ganancia x3 → T = mv/30
+    // LM35: 10mV/°C → normalizado a °C
     return (suma / 10) / 10.0f;
 }
 
@@ -134,8 +136,14 @@ float ldr_read(void) {
         adc_cali_raw_to_voltage(adc1_cali_handle, raw, &mv);
         suma += mv;
     }
-    // divisor 3.3V-LDR-10k-GND → normalizado a 0-100%
-    return ((suma / 10) * 100.0f) / 3300.0f;
+    mv = suma / 10;
+
+    // clamp para evitar valores fuera de rango
+    if (mv < LDR_MIN_MV) mv = LDR_MIN_MV;
+    if (mv > LDR_MAX_MV) mv = LDR_MAX_MV;
+
+    // mapea el rango real a 0-100%
+    return (mv - LDR_MIN_MV) * 100.0f / (LDR_MAX_MV - LDR_MIN_MV);
 }
 
 // ─── CONTROL DE ACTUADORES ─────────────────────────────────────────────────
