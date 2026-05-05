@@ -4,6 +4,7 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/timer.h"
+#include "esp_timer.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -15,14 +16,16 @@
 #define LDR_MIN_MV    200
 #define LDR_MAX_MV    3000
 #define BOMBILLA_PIN  10
-#define STEP_PIN      18
-#define DIR_PIN       19
+#define IN1_PIN 19
+#define IN2_PIN 18
+#define IN3_PIN 21
+#define IN4_PIN 22
 #define LED_PWM_PIN   4
 
 // ─── GLOBALES ──────────────────────────────────────────────────────────────
 static float    tc            = 25.0f;
 static int      led_duty      = 0;
-static uint64_t last_step_time = 0;
+
 
 adc_oneshot_unit_handle_t adc1_handle;
 adc_cali_handle_t         adc1_cali_handle;
@@ -76,23 +79,15 @@ void stepper_init(void) {
     gpio_config_t cfg = {
         .intr_type    = GPIO_INTR_DISABLE,
         .mode         = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << STEP_PIN) | (1ULL << DIR_PIN),
+        .pin_bit_mask = (1ULL << IN1_PIN) | (1ULL << IN2_PIN) | 
+                        (1ULL << IN3_PIN) | (1ULL << IN4_PIN),
     };
     gpio_config(&cfg);
-    gpio_set_level(STEP_PIN, 0);
-    gpio_set_level(DIR_PIN,  0);
 
-    // timer con divider 80 → 1 tick = 1us
-    timer_config_t timer_cfg = {
-        .divider     = 80,
-        .counter_dir = TIMER_COUNT_UP,
-        .counter_en  = TIMER_PAUSE,
-        .alarm_en    = TIMER_ALARM_DIS,
-        .auto_reload = false,
-    };
-    timer_init(TIMER_GROUP_0, TIMER_0, &timer_cfg);
-    timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0);
-    timer_start(TIMER_GROUP_0, TIMER_0);
+    gpio_set_level(IN1_PIN, 0);
+    gpio_set_level(IN2_PIN, 0);
+    gpio_set_level(IN3_PIN, 0);
+    gpio_set_level(IN4_PIN, 0);
 }
 
 void leds_init(void) {
@@ -125,8 +120,8 @@ float lm35_read(void) {
         adc_cali_raw_to_voltage(adc1_cali_handle, raw, &mv);
         suma += mv;
     }
-    // LM35: 10mV/°C → normalizado a °C
-    return (suma / 10) / 10.0f;
+    // LM35: 10mV/°K → normalizado a °C
+    return (((suma / 10.0f) * 11.0f) / 100.0f - 273.15f)-20.0f;
 }
 
 float ldr_read(void) {
@@ -169,23 +164,46 @@ void bombilla_set(bool encendida) {
 }
 
 void stepper_run(bool horario, int steps_per_sec) {
-    uint64_t now = 0;
-    timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &now);
+    static int paso = 0;
+    static uint64_t last_time_us = 0;
+
+    const int seq[8][4] = {
+        {1,0,0,0},
+        {1,1,0,0},
+        {0,1,0,0},
+        {0,1,1,0},
+        {0,0,1,0},
+        {0,0,1,1},
+        {0,0,0,1},
+        {1,0,0,1}
+    };
+
+    uint64_t now_us = esp_timer_get_time();
     uint64_t intervalo_us = 1000000 / steps_per_sec;
 
-    if (now - last_step_time >= intervalo_us) {
-        gpio_set_level(DIR_PIN,  horario);
-        gpio_set_level(STEP_PIN, 1);
-        last_step_time = now;
-    }
-    if (now - last_step_time >= 10) {
-        gpio_set_level(STEP_PIN, 0);
+    if (now_us - last_time_us >= intervalo_us) {
+        last_time_us = now_us;
+
+        if (horario) {
+            paso++;
+            if (paso > 7) paso = 0;
+        } else {
+            paso--;
+            if (paso < 0) paso = 7;
+        }
+
+        gpio_set_level(IN1_PIN, seq[paso][0]);
+        gpio_set_level(IN2_PIN, seq[paso][1]);
+        gpio_set_level(IN3_PIN, seq[paso][2]);
+        gpio_set_level(IN4_PIN, seq[paso][3]);
     }
 }
 
 void stepper_stop(void) {
-    gpio_set_level(STEP_PIN, 0);
-    gpio_set_level(DIR_PIN,  0);
+    gpio_set_level(IN1_PIN, 0);
+    gpio_set_level(IN2_PIN, 0);
+    gpio_set_level(IN3_PIN, 0);
+    gpio_set_level(IN4_PIN, 0);
 }
 
 void leds_set(int porcentaje) {
@@ -203,7 +221,7 @@ void app_main(void) {
     leds_init();
 
     while (1) {
-        // recibir nueva Tc si el usuario la envió
+
         float nueva_tc = uart_receive_set_temp();
         if (nueva_tc != -1) tc = nueva_tc;
 
@@ -237,5 +255,6 @@ void app_main(void) {
         else                  { leds_set(0);   led_duty = 0;   }
 
         uart_send(tc, temp, led_duty);
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
