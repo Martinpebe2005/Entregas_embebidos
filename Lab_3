@@ -16,8 +16,8 @@
 #define LDR_MIN_MV    200
 #define LDR_MAX_MV    3000
 #define BOMBILLA_PIN  10
-#define IN1_PIN 19
-#define IN2_PIN 18
+#define IN1_PIN 18
+#define IN2_PIN 19
 #define IN3_PIN 21
 #define IN4_PIN 22
 #define LED_PWM_PIN   4
